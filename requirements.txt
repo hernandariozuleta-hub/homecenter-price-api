@@ -2,9 +2,4 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 requests==2.32.3
 beautifulsoup4==4.12.3
-
-# Playwright es OPCIONAL (tercer nivel de respaldo con navegador real).
-# Descomenta las dos líneas de abajo solo si vas a habilitarlo:
-# playwright==1.47.0
-# (además necesitas correr `playwright install chromium` en el build;
-#  ver README.md, sección "Habilitar Playwright")
+playwright==1.47.0
