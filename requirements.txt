@@ -2,4 +2,10 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 requests==2.32.3
 beautifulsoup4==4.12.3
+
+# Playwright: el tercer nivel de respaldo con navegador real. El binario de
+# Chromium y sus librerías de sistema NO se instalan aquí — ya vienen
+# preinstalados en la imagen Docker (ver Dockerfile). Esta línea solo
+# instala el paquete de Python que habla con ese Chromium ya instalado.
+# La versión debe coincidir con la de la imagen en el Dockerfile.
 playwright==1.47.0

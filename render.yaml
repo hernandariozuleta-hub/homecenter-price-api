@@ -1,11 +1,10 @@
 services:
   - type: web
     name: homecenter-price-api
-    env: python
+    env: docker
+    dockerfilePath: ./Dockerfile
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: ENABLE_PLAYWRIGHT
-        value: "false"
+        value: "true"
     healthCheckPath: /health
