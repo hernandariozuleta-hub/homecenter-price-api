@@ -8,10 +8,13 @@ reutiliza sus funciones, orquestando la misma cascada de búsqueda
 (API de VTEX -> scraping HTML -> Playwright opcional) que ya usa el CLI.
 
 Endpoints:
-    GET /              -> info básica del servicio
-    GET /health         -> chequeo de salud (para Render / monitoreo)
-    GET /price?q=...    -> cotización de un producto
-    GET /docs           -> documentación interactiva (Swagger, automática)
+    GET  /              -> info básica del servicio
+    GET  /health         -> chequeo de salud (para Render / monitoreo)
+    GET  /price?q=...    -> cotización de UN producto
+    POST /price/batch    -> cotización de VARIOS productos a la vez
+                             body: {"productos_para_cotizar": ["...", "..."]}
+                             respuesta: {"lista_precios": [ {...}, {...} ]}
+    GET  /docs           -> documentación interactiva (Swagger, automática)
 
 Ejecutar localmente:
     uvicorn main:app --reload
@@ -22,19 +25,29 @@ Variables de entorno:
         habilita el tercer nivel de respaldo (navegador headless). Se deja
         apagado por defecto porque en despliegues simples (sin Docker)
         Playwright normalmente no está disponible. Ver README.md.
+    MAX_BATCH_CONCURRENCY=2   (default: 2)
+        Cuántos productos de un lote se consultan en paralelo. Subir este
+        número acelera los lotes grandes pero consume más RAM (cada
+        búsqueda que cae al respaldo de Playwright abre su propio
+        navegador); en el plan Free de Render conviene dejarlo bajo.
 """
 
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import homecenter_price as hc  # noqa: E402  (import después de ajustar sys.path)
 
 ENABLE_PLAYWRIGHT = os.getenv("ENABLE_PLAYWRIGHT", "false").lower() == "true"
+MAX_BATCH_CONCURRENCY = int(os.getenv("MAX_BATCH_CONCURRENCY", "2"))
+MAX_BATCH_ITEMS = 20  # límite de seguridad por solicitud
 
 app = FastAPI(
     title="Homecenter Price API",
@@ -161,6 +174,110 @@ def price(
         return buscar_precio(q, top=top)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error consultando Homecenter: {e}")
+
+
+class SolicitudLote(BaseModel):
+    productos_para_cotizar: List[str] = Field(
+        ...,
+        description="Lista de nombres/descripciones/referencias de productos a cotizar",
+        min_length=1,
+    )
+
+
+@app.post("/price/batch")
+def price_batch(
+    payload: SolicitudLote,
+    top: int = Query(15, ge=1, le=50, description="Cantidad de resultados a considerar por producto"),
+):
+    """
+    Cotiza VARIOS productos en una sola llamada.
+
+    Entrada (JSON body):
+        {"productos_para_cotizar": ["taladro percutor bosch", "cemento gris", ...]}
+
+    Salida:
+        {"lista_precios": [ {...mismo formato que /price...}, {...}, ... ]}
+
+    El orden de "lista_precios" coincide exactamente con el orden de
+    "productos_para_cotizar" (aunque las búsquedas se resuelven en paralelo
+    por debajo, cada resultado se coloca de vuelta en su posición original).
+
+    Los productos se consultan con hasta MAX_BATCH_CONCURRENCY en paralelo
+    (por defecto 2) para no saturar la memoria del servidor, especialmente
+    cuando varias búsquedas necesitan caer al respaldo de Playwright (cada
+    una abre su propio navegador). Si un producto individual falla o lanza
+    una excepción, no tumba el lote completo: su entrada queda con
+    "found": false y un mensaje de error, y el resto de productos se
+    procesan con normalidad.
+    """
+    productos = [p.strip() for p in payload.productos_para_cotizar if p and p.strip()]
+    if not productos:
+        raise HTTPException(status_code=400, detail="'productos_para_cotizar' no puede estar vacío.")
+    if len(productos) > MAX_BATCH_ITEMS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Máximo {MAX_BATCH_ITEMS} productos por solicitud (llegaron {len(productos)}).",
+        )
+
+    resultados: List[Optional[dict]] = [None] * len(productos)
+
+    with ThreadPoolExecutor(max_workers=MAX_BATCH_CONCURRENCY) as executor:
+        futuros = {executor.submit(buscar_precio, prod, top): idx for idx, prod in enumerate(productos)}
+        for futuro in as_completed(futuros):
+            idx = futuros[futuro]
+            try:
+                resultados[idx] = futuro.result()
+            except Exception as e:
+                resultados[idx] = {
+                    "query": productos[idx],
+                    "found": False,
+                    "message": f"Error inesperado consultando este producto: {e}",
+                }
+
+    return {"lista_precios": resultados}
+
+
+@app.get("/debug/playwright")
+def debug_playwright(q: str = Query(..., min_length=1)):
+    """
+    Endpoint de DIAGNÓSTICO (bórralo o protégelo antes de producción real).
+    Abre la página de búsqueda con Playwright y devuelve qué cargó
+    realmente (título, tamaño del HTML, primeras líneas de texto visible),
+    para confirmar si el sitio está devolviendo resultados normales o una
+    página de verificación/challenge anti-bot cuando la visita un servidor
+    en la nube en vez de una IP residencial.
+    """
+    if not (ENABLE_PLAYWRIGHT and hc.HAS_PLAYWRIGHT):
+        raise HTTPException(status_code=400, detail="Playwright no está habilitado en este despliegue.")
+
+    from playwright.sync_api import sync_playwright
+    from bs4 import BeautifulSoup
+    import re as _re
+
+    search_url = f"{hc.BASE_URL}/homecenter-co/search?Ntt={q}"
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(user_agent=hc.HEADERS["User-Agent"], locale="es-CO")
+            page = context.new_page()
+            page.goto(search_url, timeout=25000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            final_url = page.url
+            title = page.title()
+            html = page.content()
+            browser.close()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Error abriendo la página con Playwright: {e}")
+
+    texto_visible = _re.sub(r"\s+", " ", BeautifulSoup(html, "html.parser").get_text()).strip()
+
+    return {
+        "url_solicitada": search_url,
+        "url_final": final_url,
+        "titulo_pagina": title,
+        "tamano_html_bytes": len(html),
+        "texto_visible_preview": texto_visible[:800],
+    }
 
 
 if __name__ == "__main__":
