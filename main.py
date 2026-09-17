@@ -34,6 +34,7 @@ Variables de entorno:
 
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
@@ -48,6 +49,13 @@ import homecenter_price as hc  # noqa: E402  (import después de ajustar sys.pat
 ENABLE_PLAYWRIGHT = os.getenv("ENABLE_PLAYWRIGHT", "false").lower() == "true"
 MAX_BATCH_CONCURRENCY = int(os.getenv("MAX_BATCH_CONCURRENCY", "2"))
 MAX_BATCH_ITEMS = 20  # límite de seguridad por solicitud
+
+# La API síncrona de Playwright no admite correr desde varios hilos al mismo
+# tiempo dentro de un mismo proceso (puede fallar en silencio). Este lock
+# asegura que, aunque varios productos de un lote se procesen en paralelo,
+# el paso de Playwright de cada uno se ejecute uno a la vez. Los pasos más
+# rápidos (API de VTEX, HTML) sí siguen corriendo en paralelo sin restricción.
+_playwright_lock = threading.Lock()
 
 app = FastAPI(
     title="Homecenter Price API",
@@ -108,7 +116,8 @@ def buscar_precio(query: str, top: int = 15, exact_threshold: float = 0.92) -> d
         source = "html_fallback"
 
     if not results and ENABLE_PLAYWRIGHT and hc.HAS_PLAYWRIGHT:
-        results = hc.search_playwright_fallback(query, limit=top, headless=True)
+        with _playwright_lock:
+            results = hc.search_playwright_fallback(query, limit=top, headless=True)
         source = "playwright_fallback"
 
     if not results:
