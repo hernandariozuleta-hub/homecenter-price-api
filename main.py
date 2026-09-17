@@ -41,7 +41,7 @@ from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import homecenter_price as hc  # noqa: E402  (import después de ajustar sys.path)
@@ -191,6 +191,21 @@ class SolicitudLote(BaseModel):
         description="Lista de nombres/descripciones/referencias de productos a cotizar",
         min_length=1,
     )
+
+    @field_validator("productos_para_cotizar", mode="before")
+    @classmethod
+    def aceptar_texto_simple(cls, v):
+        """
+        Tolerancia: si llega un solo texto en vez de una lista (como hace
+        Skala hoy, que manda "productos_para_cotizar": "cemento gris" en
+        vez de ["cemento gris"]), lo envolvemos en una lista de un solo
+        elemento en vez de rechazar la solicitud. Así el mismo endpoint
+        sirve tanto para un cliente que manda un solo producto como texto
+        plano, como para uno que sí manda una lista real.
+        """
+        if isinstance(v, str):
+            return [v]
+        return v
 
 
 @app.post("/price/batch")
